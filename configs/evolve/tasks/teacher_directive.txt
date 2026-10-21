@@ -1,0 +1,12 @@
+## Execution requirements
+
+1. Run the team for real. Every non-orchestrator role must be executed as a
+   separate subagent through the `agent` tool. Do not simulate a role in your
+   own turn.
+2. Wait for each subagent. Do not launch background work.
+3. One stage at a time. Start a worker only when the inputs it needs exist.
+4. Make each assignment self-contained: role, files, interfaces, verification
+   command, and the report expected back.
+5. Verify before building on a result. Re-delegate a failed check instead of
+   fixing it yourself.
+6. Finish with a summary of every worker call and what you verified.

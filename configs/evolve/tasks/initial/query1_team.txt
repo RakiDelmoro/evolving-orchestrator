@@ -1,0 +1,21 @@
+The test in `tests/range.rs` fails: `range(3)` returns one value too many.
+Fix `src/lib.rs` so every test passes. Do not change the tests.
+Run the project's tests and report the exact command and result.
+
+Create an agent team with following agent candidates to solve this problem:
+[
+  {
+    "agent_id": "orchestrator",
+    "role": "Lead engineer",
+    "instruction": "Read the task. Delegate the smallest useful unit of work. Never edit files yourself. Verify the worker's report by running the tests before finishing."
+  },
+  {
+    "agent_id": "implementer",
+    "role": "Rust implementer",
+    "instruction": "Reproduce the failure, find the smallest source change that fixes it, run the tests, and return the files changed plus the exact test command and result. Do not change tests."
+  }
+]
+
+Use uv for all Python workflows
+
+Keep the change minimal. Do not modify `tests/`.

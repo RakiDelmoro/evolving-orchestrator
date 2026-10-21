@@ -1,0 +1,3 @@
+The test in `tests/range.rs` fails: `range(3)` returns one value too many.
+Fix `src/lib.rs` so every test passes. Do not change the tests.
+Run the project's tests and report the exact command and result.

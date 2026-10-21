@@ -1,0 +1,14 @@
+node_modules/
+
+# Rust build output.
+/target/
+
+# Evolving Orchestrator bookkeeping: run directories, episodes, training and export output.
+.evolve/
+runs/
+
+*.log
+
+# Model weights are large and never part of the source.
+*.gguf
+*.safetensors

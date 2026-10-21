@@ -1,0 +1,19 @@
+[package]
+name = "evolving-orchestrator"
+version = "0.1.0"
+edition = "2021"
+description = "A workflow-evolution harness: search team designs, rank trajectories, and train a shared model"
+license = "MIT"
+repository = "https://github.com/RakiDelmoro/evolving-orchestrator"
+
+[[bin]]
+name = "evolve"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+glob = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+ureq = { version = "2.12", features = ["json"] }
