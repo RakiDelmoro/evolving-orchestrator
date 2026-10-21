@@ -58,6 +58,29 @@ There is no concurrency setting.
 
 ## Quick start
 
+## 35B MoE (inference only)
+
+Qwen3.5-35B-A3B Q4_K_M is 22.29 GB and fits in the host's 62 GB RAM. Serve it
+with `-cmoe` so the MoE experts stay on CPU while attention and KV cache use
+the 8 GB GPU:
+
+```bash
+llama-server -m ~/models/Qwen_Qwen3.5-35B-A3B-Q4_K_M.gguf \
+  --alias Qwen3.5-35B-A3B --jinja -ngl 999 -cmoe -c 65536 -t 12 \
+  --host 127.0.0.1 --port 8080
+```
+
+Then run task mode, which stops before training:
+
+```bash
+evolve cycle --config configs/evolve/local-35b.json \
+  --tasks configs/evolve/tasks --task-only
+```
+
+See [`crates/evolving-orchestrator/35B-MOE.md`](crates/evolving-orchestrator/35B-MOE.md)
+for memory tuning and the Pi provider example.
+
+
 ```bash
 # 1. Serve the local model (one model, one port).
 llama-server \

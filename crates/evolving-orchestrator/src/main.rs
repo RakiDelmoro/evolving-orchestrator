@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use evolving_orchestrator::chat::{ChatOptions, OpenAiChat};
 use evolving_orchestrator::collect::{collect, read_pool};
 use evolving_orchestrator::config::CycleConfig;
-use evolving_orchestrator::cycle::{run_cycle, CyclePaths, CyclePorts};
+use evolving_orchestrator::cycle::{run_cycle_with_options, CycleOptions, CyclePaths, CyclePorts};
 use evolving_orchestrator::design::TaskCatalog;
 use evolving_orchestrator::error::{EvolveError, Result};
 use evolving_orchestrator::exec::ProcessRunner;
@@ -106,12 +106,15 @@ enum Command {
         #[arg(long, default_value = "configs/evolve/tasks")]
         tasks: PathBuf,
     },
-    /// Run one complete cycle.
+    /// Run one cycle. `--task-only` stops after ranking and publishing.
     Cycle {
         #[arg(long, default_value = "configs/evolve/local-3b.json")]
         config: PathBuf,
         #[arg(long, default_value = "configs/evolve/tasks")]
         tasks: PathBuf,
+        /// Stop after search, collection, ranking, selection, and publishing.
+        #[arg(long)]
+        task_only: bool,
     },
 }
 
@@ -145,7 +148,11 @@ fn run() -> Result<()> {
         Command::Render { config, tasks } => render_stage(&config, &tasks),
         Command::Train { config, tasks } => train_stage(&config, &tasks),
         Command::Export { config, tasks } => export_stage(&config, &tasks),
-        Command::Cycle { config, tasks } => cycle_stage(&config, &tasks),
+        Command::Cycle {
+            config,
+            tasks,
+            task_only,
+        } => cycle_stage(&config, &tasks, task_only),
     }
 }
 
@@ -537,7 +544,7 @@ fn export_stage(config_path: &Path, tasks_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cycle_stage(config_path: &Path, tasks_dir: &Path) -> Result<()> {
+fn cycle_stage(config_path: &Path, tasks_dir: &Path, task_only: bool) -> Result<()> {
     let config = load(config_path)?;
     let catalog = TaskCatalog::new(tasks_dir);
     let chat = chat(&config);
@@ -550,10 +557,16 @@ fn cycle_stage(config_path: &Path, tasks_dir: &Path) -> Result<()> {
         options: options(&config, 1),
     };
     let runner = ProcessRunner::new(config.executor.clone());
-    let trainer = CommandTrainer::from_env()
-        .ok_or_else(|| EvolveError::Training("EVOLVE_TRAIN_COMMAND is not set".into()))?;
-    let exporter = CommandExporter::from_env()
-        .ok_or_else(|| EvolveError::Training("EVOLVE_EXPORT_COMMAND is not set".into()))?;
+    let trainer = CommandTrainer::from_env();
+    let exporter = CommandExporter::from_env();
+    if !task_only && (trainer.is_none() || exporter.is_none()) {
+        return Err(EvolveError::Training(
+            "EVOLVE_TRAIN_COMMAND and EVOLVE_EXPORT_COMMAND are required unless --task-only is set"
+                .into(),
+        ));
+    }
+    let trainer = trainer.unwrap_or_else(|| CommandTrainer::new("/bin/false", Vec::new()));
+    let exporter = exporter.unwrap_or_else(|| CommandExporter::new("/bin/false", Vec::new()));
     let tokenizer: Box<dyn Tokenizer> = match CommandTokenizer::from_env() {
         Some(tokenizer) => Box::new(tokenizer),
         None => {
@@ -562,7 +575,7 @@ fn cycle_stage(config_path: &Path, tasks_dir: &Path) -> Result<()> {
         }
     };
 
-    let outcome = run_cycle(
+    let outcome = run_cycle_with_options(
         &config,
         &catalog,
         &CyclePaths {
@@ -578,9 +591,10 @@ fn cycle_stage(config_path: &Path, tasks_dir: &Path) -> Result<()> {
             trainer: &trainer,
             exporter: &exporter,
         },
+        CycleOptions { train: !task_only },
     )?;
     println!(
-        "cycle {}: {} episodes, {} windows, checkpoint {}, exported {}",
+        "cycle {}: {} episodes, {} windows, checkpoint {}, exported {}, trained {}",
         outcome.summary.generation,
         outcome.summary.episodes,
         outcome.summary.windows,
@@ -589,7 +603,8 @@ fn cycle_stage(config_path: &Path, tasks_dir: &Path) -> Result<()> {
             .checkpoint_step
             .map(|step| step.to_string())
             .unwrap_or_else(|| "none".into()),
-        outcome.exported
+        outcome.exported,
+        outcome.summary.trained
     );
     Ok(())
 }

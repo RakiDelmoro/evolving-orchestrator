@@ -1,0 +1,68 @@
+{
+  "generation": 0,
+  "run_dir": "runs/L0-35b",
+  "model_id": "Qwen3.5-35B-A3B",
+  "endpoint": "http://127.0.0.1:8080/v1",
+  "tasks": {
+    "train_candidates": [1],
+    "train": [1],
+    "test": [],
+    "excluded": []
+  },
+  "search": {
+    "iterations": 3,
+    "seed_base": 450000,
+    "rule": "retained-best"
+  },
+  "collection": {
+    "candidates": 4,
+    "train_ranks": 3,
+    "validation_rank": 4,
+    "seed_base": 710000
+  },
+  "ranking": {
+    "opponents_per_episode": 2,
+    "seed": 1234
+  },
+  "training": {
+    "window": 1024,
+    "context_overlap": 128,
+    "steps": 100,
+    "lr": 0.0002,
+    "warmup_steps": 5,
+    "min_lr_ratio": 0.1,
+    "lora_r": 16,
+    "lora_alpha": 32,
+    "lora_dropout": 0.05,
+    "save_every": 25,
+    "val_every": 50,
+    "replicas": 1,
+    "gpus_per_rank": 1,
+    "grad_accum": 3,
+    "ce_chunk": 128,
+    "seed": 1234
+  },
+  "executor": {
+    "program": "pi",
+    "args": [
+      "--print",
+      "--mode",
+      "json",
+      "--provider",
+      "local",
+      "--model",
+      "Qwen3.5-35B-A3B",
+      "--approve",
+      "--no-context-files"
+    ],
+    "stdin_prompt": false,
+    "prompt_arg": true,
+    "timeout_seconds": 3600
+  },
+  "judge": {
+    "api_key_env": "EVOLVE_API_KEY",
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "max_output_tokens": 2048
+  }
+}

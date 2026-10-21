@@ -37,6 +37,17 @@ pub struct CyclePorts<'a> {
     pub exporter: &'a dyn Exporter,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CycleOptions {
+    pub train: bool,
+}
+
+impl Default for CycleOptions {
+    fn default() -> Self {
+        Self { train: true }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CycleSummary {
     pub generation: u32,
@@ -45,6 +56,7 @@ pub struct CycleSummary {
     pub windows: usize,
     pub checkpoint_step: Option<u32>,
     pub exported: bool,
+    pub trained: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,6 +84,16 @@ pub fn run_cycle(
     catalog: &TaskCatalog,
     paths: &CyclePaths,
     ports: &CyclePorts<'_>,
+) -> Result<CycleOutcome> {
+    run_cycle_with_options(config, catalog, paths, ports, CycleOptions::default())
+}
+
+pub fn run_cycle_with_options(
+    config: &CycleConfig,
+    catalog: &TaskCatalog,
+    paths: &CyclePaths,
+    ports: &CyclePorts<'_>,
+    options: CycleOptions,
 ) -> Result<CycleOutcome> {
     let teacher_directive = fs::read_to_string(&paths.teacher_directive).map_err(|error| {
         EvolveError::Config(format!(
@@ -171,49 +193,51 @@ pub fn run_cycle(
         validation_rows.push(selection.validation.clone());
         selections.push((*id, ranked));
 
-        let render_config = RenderConfig {
-            window: config.training.window as usize,
-            context_overlap: config.training.context_overlap as usize,
-        };
-        for row in selection
-            .train
-            .iter()
-            .chain(std::iter::once(&selection.validation))
-        {
-            let teacher_prompt = row
-                .teacher_prompt
-                .as_ref()
-                .ok_or_else(|| {
-                    EvolveError::Training(format!("episode {} has no teacher prompt", row.name))
-                })
-                .and_then(|path| fs::read_to_string(path).map_err(EvolveError::from))?;
-            let substitution = PromptSubstitution {
-                from: teacher_prompt,
-                to: task.prompt.trim().to_string(),
+        if options.train {
+            let render_config = RenderConfig {
+                window: config.training.window as usize,
+                context_overlap: config.training.context_overlap as usize,
             };
-            let sessions = load_sessions(&row.logs_dir.join("sessions"))?;
-            let windows = render_sessions(
-                &sessions,
-                ports.tokenizer,
-                render_config,
-                Some(&substitution),
-                &row.name,
-                *id,
-            )?;
-            if windows.is_empty() {
-                return Err(EvolveError::Training(format!(
-                    "episode {} produced no windows",
-                    row.name
-                )));
-            }
-            if selection
+            for row in selection
                 .train
                 .iter()
-                .any(|candidate| candidate.name == row.name)
+                .chain(std::iter::once(&selection.validation))
             {
-                train_windows.extend(windows);
-            } else {
-                validation_windows.extend(windows);
+                let teacher_prompt = row
+                    .teacher_prompt
+                    .as_ref()
+                    .ok_or_else(|| {
+                        EvolveError::Training(format!("episode {} has no teacher prompt", row.name))
+                    })
+                    .and_then(|path| fs::read_to_string(path).map_err(EvolveError::from))?;
+                let substitution = PromptSubstitution {
+                    from: teacher_prompt,
+                    to: task.prompt.trim().to_string(),
+                };
+                let sessions = load_sessions(&row.logs_dir.join("sessions"))?;
+                let windows = render_sessions(
+                    &sessions,
+                    ports.tokenizer,
+                    render_config,
+                    Some(&substitution),
+                    &row.name,
+                    *id,
+                )?;
+                if windows.is_empty() {
+                    return Err(EvolveError::Training(format!(
+                        "episode {} produced no windows",
+                        row.name
+                    )));
+                }
+                if selection
+                    .train
+                    .iter()
+                    .any(|candidate| candidate.name == row.name)
+                {
+                    train_windows.extend(windows);
+                } else {
+                    validation_windows.extend(windows);
+                }
             }
         }
     }
@@ -224,14 +248,39 @@ pub fn run_cycle(
         ));
     }
 
+    let selection_dir = paths.run_dir.join("selection");
+    write_json(&selection_dir.join("train.json"), &train_rows)?;
+    write_json(&selection_dir.join("val.json"), &validation_rows)?;
+
+    if !options.train {
+        let summary = CycleSummary {
+            generation: config.generation,
+            tasks: task_summaries,
+            episodes: episode_count,
+            windows: 0,
+            checkpoint_step: None,
+            exported: false,
+            trained: false,
+        };
+        write_json(&paths.run_dir.join("cycle_summary.json"), &summary)?;
+        return Ok(CycleOutcome {
+            searches,
+            selections,
+            train_rows,
+            validation_rows,
+            windows: 0,
+            checkpoint: None,
+            exported: false,
+            summary,
+        });
+    }
+
     let data_dir = paths.run_dir.join("data");
     fs::create_dir_all(&data_dir)?;
     let train_file = data_dir.join("train.jsonl");
     let validation_file = data_dir.join("val.jsonl");
     write_windows(&train_file, &train_windows)?;
     write_windows(&validation_file, &validation_windows)?;
-    write_json(&paths.run_dir.join("selection/train.json"), &train_rows)?;
-    write_json(&paths.run_dir.join("selection/val.json"), &validation_rows)?;
 
     let outcome = ports.trainer.train(&TrainRequest {
         run_dir: paths.run_dir.clone(),
@@ -268,6 +317,7 @@ pub fn run_cycle(
         windows: train_windows.len() + validation_windows.len(),
         checkpoint_step: outcome.checkpoint.as_ref().map(|value| value.step),
         exported,
+        trained: true,
     };
     write_json(&paths.run_dir.join("cycle_summary.json"), &summary)?;
 
