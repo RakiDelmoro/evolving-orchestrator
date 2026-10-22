@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::collect::collect;
 use crate::config::CycleConfig;
 use crate::design::TaskCatalog;
 use crate::error::{EvolveError, Result};
@@ -14,10 +13,11 @@ use crate::export::{ExportRequest, Exporter};
 use crate::io::write_json;
 use crate::judge::PairwiseJudge;
 use crate::pi_session::load_sessions;
+use crate::quality::{evaluate_quality, RubricJudge};
 use crate::render::{
     render_sessions, write_windows, PromptSubstitution, RenderConfig, SftWindow, Tokenizer,
 };
-use crate::search::{run_search, Proposer, SearchOutcome, SearchPaths};
+use crate::search::{run_search_seeded, Proposer, SearchOutcome, SearchPaths, SearchSeed};
 use crate::select::{rank_candidates, select_rows, Candidate, RankedEpisode};
 use crate::train::{Checkpoint, TrainRequest, Trainer};
 
@@ -35,16 +35,23 @@ pub struct CyclePorts<'a> {
     pub tokenizer: &'a dyn Tokenizer,
     pub trainer: &'a dyn Trainer,
     pub exporter: &'a dyn Exporter,
+    pub quality_judge: &'a dyn RubricJudge,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CycleOptions {
     pub train: bool,
+    pub base_workspace: Option<PathBuf>,
+    pub initial_design: Option<String>,
+    pub gate_feedback: Option<String>,
 }
 
-impl Default for CycleOptions {
-    fn default() -> Self {
-        Self { train: true }
+impl CycleOptions {
+    pub fn training() -> Self {
+        Self {
+            train: true,
+            ..Self::default()
+        }
     }
 }
 
@@ -57,6 +64,7 @@ pub struct CycleSummary {
     pub checkpoint_step: Option<u32>,
     pub exported: bool,
     pub trained: bool,
+    pub accepted: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,6 +74,8 @@ pub struct TaskSummary {
     pub beats_reference: bool,
     pub collected: usize,
     pub ranked: usize,
+    pub accepted: bool,
+    pub quality_score: Option<f64>,
 }
 
 pub struct CycleOutcome {
@@ -85,7 +95,7 @@ pub fn run_cycle(
     paths: &CyclePaths,
     ports: &CyclePorts<'_>,
 ) -> Result<CycleOutcome> {
-    run_cycle_with_options(config, catalog, paths, ports, CycleOptions::default())
+    run_cycle_with_options(config, catalog, paths, ports, CycleOptions::training())
 }
 
 pub fn run_cycle_with_options(
@@ -112,10 +122,25 @@ pub fn run_cycle_with_options(
     let mut episode_count = 0usize;
 
     for id in &config.tasks.train {
-        let task = catalog.load(*id, "software")?;
+        let mut task = catalog.load(*id, "software")?;
+        if let Some(feedback) = &options.gate_feedback {
+            if !feedback.trim().is_empty() {
+                let addition = format!(
+                    "\n\n# Previous quality failures (fix these)\n\n{}",
+                    feedback.trim()
+                );
+                task.prompt.push_str(&addition);
+                task.task_text.push_str(&addition);
+            }
+        }
         let parsed = catalog.parse(*id)?;
         let search_paths = SearchPaths::new(&paths.run_dir, parsed.query_name.clone());
-        let outcome = run_search(
+        let seed = SearchSeed {
+            initial_design: options.initial_design.as_deref(),
+            base_workspace: options.base_workspace.as_deref(),
+            gate_feedback: options.gate_feedback.as_deref(),
+        };
+        let outcome = run_search_seeded(
             config,
             &task,
             &parsed,
@@ -123,6 +148,7 @@ pub fn run_cycle_with_options(
             ports.runner,
             ports.judge,
             ports.proposer,
+            &seed,
         )?;
         searches.push((*id, outcome.clone()));
         task_summaries.push(TaskSummary {
@@ -131,18 +157,21 @@ pub fn run_cycle_with_options(
             beats_reference: outcome.beats_reference,
             collected: 0,
             ranked: 0,
+            accepted: false,
+            quality_score: None,
         });
         if !outcome.beats_reference {
             continue;
         }
 
-        let collection = collect(
+        let collection = crate::collect::collect_with_base(
             config,
             &task,
             &outcome.champion_design,
             &teacher_directive,
             &paths.run_dir,
             ports.runner,
+            options.base_workspace.as_deref(),
         )?;
         episode_count += collection.rows.len();
         if let Some(summary) = task_summaries.last_mut() {
@@ -185,15 +214,30 @@ pub fn run_cycle_with_options(
             &ranked,
         )?;
 
-        if let Some(best) = ranked.first() {
-            publish_workspace(&paths.run_dir, *id, best, outcome.retained_version)?;
+        let quality = evaluate_quality(
+            &ranked[0].workspace,
+            &task.task_text,
+            &config.quality,
+            ports.quality_judge,
+        )?;
+        let output_dir = paths.run_dir.join("outputs").join(format!("query{id}"));
+        fs::create_dir_all(&output_dir)?;
+        write_json(&output_dir.join("quality.json"), &quality)?;
+        if let Some(summary) = task_summaries.last_mut() {
+            summary.accepted = quality.accepted;
+            summary.quality_score = Some(quality.weighted_score);
         }
-
-        train_rows.extend(selection.train.iter().cloned());
-        validation_rows.push(selection.validation.clone());
+        if quality.accepted {
+            publish_workspace(&paths.run_dir, *id, &ranked[0], outcome.retained_version)?;
+            train_rows.extend(selection.train.iter().cloned());
+            validation_rows.push(selection.validation.clone());
+        } else {
+            let reasons = quality.reasons.join("\n");
+            fs::write(output_dir.join("REJECTED"), reasons)?;
+        }
         selections.push((*id, ranked));
 
-        if options.train {
+        if options.train && quality.accepted {
             let render_config = RenderConfig {
                 window: config.training.window as usize,
                 context_overlap: config.training.context_overlap as usize,
@@ -242,7 +286,7 @@ pub fn run_cycle_with_options(
         }
     }
 
-    if train_rows.is_empty() || validation_rows.is_empty() {
+    if options.train && (train_rows.is_empty() || validation_rows.is_empty()) {
         return Err(EvolveError::Training(
             "no eligible training or validation episodes".into(),
         ));
@@ -253,6 +297,7 @@ pub fn run_cycle_with_options(
     write_json(&selection_dir.join("val.json"), &validation_rows)?;
 
     if !options.train {
+        let accepted = task_summaries.iter().all(|task| task.accepted);
         let summary = CycleSummary {
             generation: config.generation,
             tasks: task_summaries,
@@ -261,6 +306,7 @@ pub fn run_cycle_with_options(
             checkpoint_step: None,
             exported: false,
             trained: false,
+            accepted,
         };
         write_json(&paths.run_dir.join("cycle_summary.json"), &summary)?;
         return Ok(CycleOutcome {
@@ -310,6 +356,7 @@ pub fn run_cycle_with_options(
         exported = true;
     }
 
+    let accepted = task_summaries.iter().all(|task| task.accepted);
     let summary = CycleSummary {
         generation: config.generation,
         tasks: task_summaries,
@@ -318,6 +365,7 @@ pub fn run_cycle_with_options(
         checkpoint_step: outcome.checkpoint.as_ref().map(|value| value.step),
         exported,
         trained: true,
+        accepted,
     };
     write_json(&paths.run_dir.join("cycle_summary.json"), &summary)?;
 
@@ -383,8 +431,22 @@ mod tests {
     use crate::export::Exporter;
     use crate::judge::{Verdict, Winner, WorkspaceBundle};
     use crate::prompt::ProposalInput;
+    use crate::quality::{DimensionRule, DimensionScore, RubricJudge};
     use crate::train::{TrainOutcome, TrainRequest};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FixedRubric;
+
+    impl RubricJudge for FixedRubric {
+        fn score(
+            &self,
+            _task: &str,
+            _workspace: &Path,
+            _dimensions: &[DimensionRule],
+        ) -> Result<Vec<DimensionScore>> {
+            Ok(Vec::new())
+        }
+    }
 
     struct FakeRunner;
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -536,6 +598,7 @@ mod tests {
                 tokenizer: &steps,
                 trainer: &FakeTrainer,
                 exporter: &FakeExporter,
+                quality_judge: &FixedRubric,
             },
         )
         .expect("cycle");

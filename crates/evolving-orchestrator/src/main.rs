@@ -1,5 +1,6 @@
 //! Command-line entry point.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
@@ -11,9 +12,10 @@ use evolving_orchestrator::design::TaskCatalog;
 use evolving_orchestrator::error::{EvolveError, Result};
 use evolving_orchestrator::exec::ProcessRunner;
 use evolving_orchestrator::export::{CommandExporter, ExportRequest, Exporter};
-use evolving_orchestrator::io::{read_json, write_json};
+use evolving_orchestrator::io::{append_record, read_json, write_json};
 use evolving_orchestrator::judge::ModelJudge;
 use evolving_orchestrator::pi_session::load_sessions;
+use evolving_orchestrator::quality::{GateStatus, ModelRubricJudge, QualityReport};
 use evolving_orchestrator::render::{
     write_windows, ByteTokenizer, CommandTokenizer, PromptSubstitution, RenderConfig, SftWindow,
     Tokenizer,
@@ -23,6 +25,7 @@ use evolving_orchestrator::search::{
 };
 use evolving_orchestrator::select::{rank_candidates, select_rows, Candidate, RankedEpisode};
 use evolving_orchestrator::train::{CommandTrainer, TrainRequest, Trainer};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -106,6 +109,23 @@ enum Command {
         #[arg(long, default_value = "configs/evolve/tasks")]
         tasks: PathBuf,
     },
+    /// Long-running task loop: repeat attempts until every quality gate passes.
+    Task {
+        #[arg(long, default_value = "configs/evolve/local-3b.json")]
+        config: PathBuf,
+        #[arg(long, default_value = "configs/evolve/tasks")]
+        tasks: PathBuf,
+        /// Base repository copied into the first attempt. Later attempts start
+        /// from the best rejected workspace.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// 0 means no attempt cap; the stagnation guard still applies.
+        #[arg(long, default_value_t = 0)]
+        max_attempts: u32,
+        /// Stop after this many attempts with no score or gate progress.
+        #[arg(long, default_value_t = 5)]
+        stagnation_limit: u32,
+    },
     /// Run one cycle. `--task-only` stops after ranking and publishing.
     Cycle {
         #[arg(long, default_value = "configs/evolve/local-3b.json")]
@@ -148,6 +168,19 @@ fn run() -> Result<()> {
         Command::Render { config, tasks } => render_stage(&config, &tasks),
         Command::Train { config, tasks } => train_stage(&config, &tasks),
         Command::Export { config, tasks } => export_stage(&config, &tasks),
+        Command::Task {
+            config,
+            tasks,
+            repo,
+            max_attempts,
+            stagnation_limit,
+        } => task_stage(
+            &config,
+            &tasks,
+            repo.as_deref(),
+            max_attempts,
+            stagnation_limit,
+        ),
         Command::Cycle {
             config,
             tasks,
@@ -544,6 +577,266 @@ fn export_stage(config_path: &Path, tasks_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TaskLoopState {
+    attempt: u32,
+    accepted: bool,
+    best_score: f64,
+    best_gates_passed: usize,
+    best_design: Option<String>,
+    best_workspace: Option<PathBuf>,
+    last_reasons: Vec<String>,
+    stagnation: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AttemptRecord {
+    attempt: u32,
+    accepted: bool,
+    score: f64,
+    gates_passed: usize,
+    reasons: Vec<String>,
+    error: Option<String>,
+    duration_seconds: u64,
+}
+
+fn task_stage(
+    config_path: &Path,
+    tasks_dir: &Path,
+    repo: Option<&Path>,
+    max_attempts: u32,
+    stagnation_limit: u32,
+) -> Result<()> {
+    let config = load(config_path)?;
+    if config.quality.gates.is_empty() && config.quality.dimensions.is_empty() {
+        return Err(EvolveError::Config(
+            "quality policy is empty; the task loop would accept immediately".into(),
+        ));
+    }
+    let catalog = TaskCatalog::new(tasks_dir);
+    let chat = chat(&config);
+    let judge = ModelJudge {
+        chat: &chat,
+        options: options(&config, 0),
+    };
+    let proposer = ModelProposer {
+        chat: &chat,
+        options: options(&config, 1),
+    };
+    let rubric = ModelRubricJudge {
+        chat: &chat,
+        options: options(&config, 2),
+    };
+    let runner = ProcessRunner::new(config.executor.clone());
+    let tokenizer: Box<dyn Tokenizer> = match CommandTokenizer::from_env() {
+        Some(tokenizer) => Box::new(tokenizer),
+        None => {
+            eprintln!("warning: EVOLVE_TOKENIZE_COMMAND is not set; using byte tokens");
+            Box::new(ByteTokenizer)
+        }
+    };
+    let trainer = CommandTrainer::new("/bin/false", Vec::new());
+    let exporter = CommandExporter::new("/bin/false", Vec::new());
+
+    let state_path = config.run_dir.join("task-loop.json");
+    let attempts_path = config.run_dir.join("attempts.jsonl");
+    fs::create_dir_all(&config.run_dir)?;
+    let mut state: TaskLoopState = if state_path.is_file() {
+        read_json(&state_path)?
+    } else {
+        TaskLoopState::default()
+    };
+    if state.accepted {
+        println!("task loop already accepted at attempt {}", state.attempt);
+        return Ok(());
+    }
+
+    loop {
+        let attempt = state.attempt + 1;
+        if max_attempts > 0 && attempt > max_attempts {
+            return Err(EvolveError::Training(format!(
+                "no accepted workspace after {max_attempts} attempts; best score {:.1}",
+                state.best_score
+            )));
+        }
+        let attempt_dir = config
+            .run_dir
+            .join("attempts")
+            .join(format!("{attempt:04}"));
+        fs::create_dir_all(&attempt_dir)?;
+        let mut attempt_config = config.clone();
+        attempt_config.run_dir = attempt_dir.clone();
+
+        let base_workspace = state
+            .best_workspace
+            .clone()
+            .or_else(|| repo.map(Path::to_path_buf));
+        let options = CycleOptions {
+            train: false,
+            base_workspace,
+            initial_design: state.best_design.clone(),
+            gate_feedback: if state.last_reasons.is_empty() {
+                None
+            } else {
+                Some(state.last_reasons.join("\n"))
+            },
+        };
+
+        let started = std::time::Instant::now();
+        let outcome = run_cycle_with_options(
+            &attempt_config,
+            &catalog,
+            &CyclePaths {
+                run_dir: attempt_dir.clone(),
+                tasks_dir: tasks_dir.to_path_buf(),
+                teacher_directive: tasks_dir.join("teacher_directive.txt"),
+            },
+            &CyclePorts {
+                runner: &runner,
+                judge: &judge,
+                proposer: &proposer,
+                tokenizer: tokenizer.as_ref(),
+                trainer: &trainer,
+                exporter: &exporter,
+                quality_judge: &rubric,
+            },
+            options,
+        );
+
+        let (accepted, score, gates_passed, reasons, error) = match &outcome {
+            Ok(outcome) => {
+                let mut reports = Vec::new();
+                for task in &attempt_config.tasks.train {
+                    let path = attempt_dir
+                        .join("outputs")
+                        .join(format!("query{task}"))
+                        .join("quality.json");
+                    if path.is_file() {
+                        reports.push(read_json::<QualityReport>(&path)?);
+                    }
+                }
+                let score = reports
+                    .iter()
+                    .map(|report| report.weighted_score)
+                    .fold(f64::INFINITY, f64::min);
+                let score = if score.is_finite() { score } else { 0.0 };
+                let gates_passed = reports
+                    .iter()
+                    .flat_map(|report| report.gates.iter())
+                    .filter(|gate| gate.status == GateStatus::Pass)
+                    .count();
+                let reasons: Vec<String> = reports
+                    .iter()
+                    .flat_map(|report| report.reasons.iter().cloned())
+                    .collect();
+                (outcome.summary.accepted, score, gates_passed, reasons, None)
+            }
+            Err(error) => (
+                false,
+                state.best_score,
+                state.best_gates_passed,
+                Vec::new(),
+                Some(error.to_string()),
+            ),
+        };
+
+        let duration_seconds = started.elapsed().as_secs();
+        let improved =
+            accepted || score > state.best_score + 0.5 || gates_passed > state.best_gates_passed;
+        if accepted {
+            state.accepted = true;
+        } else if improved {
+            state.best_score = score;
+            state.best_gates_passed = gates_passed;
+            state.stagnation = 0;
+            if let Ok(outcome) = &outcome {
+                if let Some((_, rows)) = outcome.selections.first() {
+                    if let Some(best) = rows.first() {
+                        state.best_workspace = Some(best.workspace.clone());
+                    }
+                }
+                if let Some((_, search)) = outcome.searches.first() {
+                    state.best_design = Some(search.champion_design.clone());
+                }
+            }
+        } else {
+            state.stagnation += 1;
+        }
+        state.attempt = attempt;
+        state.last_reasons = reasons.clone();
+        write_json(&state_path, &state)?;
+        append_record(
+            &attempts_path,
+            &AttemptRecord {
+                attempt,
+                accepted,
+                score,
+                gates_passed,
+                reasons: reasons.clone(),
+                error: error.clone(),
+                duration_seconds,
+            },
+        )?;
+
+        println!(
+            "attempt {attempt}: accepted={accepted} score={score:.1} gates_passed={gates_passed} stagnation={}",
+            state.stagnation
+        );
+        if let Some(error) = error {
+            eprintln!("attempt {attempt} error: {error}");
+        }
+
+        if accepted {
+            if let Ok(outcome) = &outcome {
+                publish_attempt_outputs(&config.run_dir, &attempt_dir, outcome)?;
+            }
+            println!(
+                "accepted after {attempt} attempt(s); outputs at {}",
+                config.run_dir.join("outputs").display()
+            );
+            return Ok(());
+        }
+        if stagnation_limit > 0 && state.stagnation >= stagnation_limit {
+            return Err(EvolveError::Training(format!(
+                "stopping after {} attempts without measurable progress; best score {:.1}, last reasons: {}",
+                state.stagnation,
+                state.best_score,
+                state.last_reasons.join("; ")
+            )));
+        }
+    }
+}
+
+fn publish_attempt_outputs(
+    final_run_dir: &Path,
+    attempt_dir: &Path,
+    outcome: &evolving_orchestrator::cycle::CycleOutcome,
+) -> Result<()> {
+    for (task, _) in &outcome.selections {
+        let source = attempt_dir.join("outputs").join(format!("query{task}"));
+        let target = final_run_dir.join("outputs").join(format!("query{task}"));
+        if source.is_dir() {
+            copy_tree(&source, &target)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_tree(source: &Path, target: &Path) -> Result<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        let destination = target.join(entry.file_name());
+        if entry.metadata()?.is_dir() {
+            copy_tree(&path, &destination)?;
+        } else {
+            fs::copy(&path, &destination)?;
+        }
+    }
+    Ok(())
+}
+
 fn cycle_stage(config_path: &Path, tasks_dir: &Path, task_only: bool) -> Result<()> {
     let config = load(config_path)?;
     let catalog = TaskCatalog::new(tasks_dir);
@@ -557,6 +850,10 @@ fn cycle_stage(config_path: &Path, tasks_dir: &Path, task_only: bool) -> Result<
         options: options(&config, 1),
     };
     let runner = ProcessRunner::new(config.executor.clone());
+    let rubric = ModelRubricJudge {
+        chat: &chat,
+        options: options(&config, 2),
+    };
     let trainer = CommandTrainer::from_env();
     let exporter = CommandExporter::from_env();
     if !task_only && (trainer.is_none() || exporter.is_none()) {
@@ -590,8 +887,12 @@ fn cycle_stage(config_path: &Path, tasks_dir: &Path, task_only: bool) -> Result<
             tokenizer: tokenizer.as_ref(),
             trainer: &trainer,
             exporter: &exporter,
+            quality_judge: &rubric,
         },
-        CycleOptions { train: !task_only },
+        CycleOptions {
+            train: !task_only,
+            ..CycleOptions::default()
+        },
     )?;
     println!(
         "cycle {}: {} episodes, {} windows, checkpoint {}, exported {}, trained {}",

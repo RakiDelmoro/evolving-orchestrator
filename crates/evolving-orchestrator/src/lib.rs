@@ -26,6 +26,7 @@ pub mod io;
 pub mod judge;
 pub mod pi_session;
 pub mod prompt;
+pub mod quality;
 pub mod ranking;
 pub mod render;
 pub mod search;

@@ -45,6 +45,7 @@ pub struct EpisodeSpec<'a> {
     pub seed: u64,
     pub model_id: &'a str,
     pub endpoint: &'a str,
+    pub base_workspace: Option<&'a Path>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +122,11 @@ impl EpisodeRunner for ProcessRunner {
             }
         } else {
             fs::create_dir_all(spec.workspace)?;
+        }
+        if let Some(base) = spec.base_workspace {
+            if base.exists() && base != spec.workspace {
+                copy_dir(base, spec.workspace)?;
+            }
         }
 
         fs::create_dir_all(spec.logs)?;
@@ -418,6 +424,21 @@ fn collect_sessions_inner(directory: &Path, out: &mut Vec<PathBuf>) -> Result<()
     Ok(())
 }
 
+fn copy_dir(source: &Path, target: &Path) -> Result<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let path = entry.path();
+        let destination = target.join(entry.file_name());
+        if entry.metadata()?.is_dir() {
+            copy_dir(&path, &destination)?;
+        } else {
+            fs::copy(&path, &destination)?;
+        }
+    }
+    Ok(())
+}
+
 fn read_tail(path: &Path, limit: usize) -> String {
     let Ok(text) = fs::read_to_string(path) else {
         return String::new();
@@ -482,6 +503,7 @@ printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[{"
                 seed: 42,
                 model_id: "local",
                 endpoint: "http://127.0.0.1:8080/v1",
+                base_workspace: None,
             })
             .expect("run");
         assert_eq!(outcome.status, EpisodeStatus::Success);
@@ -509,6 +531,7 @@ printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":
             seed: 1,
             model_id: "local",
             endpoint: "http://127.0.0.1:8080/v1",
+            base_workspace: None,
         };
         runner.run(&spec).expect("first");
         runner.run(&spec).expect("cached");
@@ -532,6 +555,7 @@ printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":
                 seed: 1,
                 model_id: "local",
                 endpoint: "http://127.0.0.1:8080/v1",
+                base_workspace: None,
             })
             .expect_err("must refuse");
         assert!(error.to_string().contains("non-empty"));
@@ -576,6 +600,7 @@ printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":
                 seed: 1,
                 model_id: "local",
                 endpoint: "http://127.0.0.1:8080/v1",
+                base_workspace: None,
             })
             .expect("run");
         assert_eq!(outcome.status, EpisodeStatus::Failed);
@@ -603,6 +628,7 @@ printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":
                 seed: 7,
                 model_id: "local",
                 endpoint: "http://127.0.0.1:8080/v1",
+                base_workspace: None,
             })
             .expect("run");
 
@@ -629,6 +655,7 @@ printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":
                 seed: 1,
                 model_id: "local",
                 endpoint: "http://127.0.0.1:8080/v1",
+                base_workspace: None,
             })
             .expect("run");
         assert_eq!(outcome.status, EpisodeStatus::Timeout);

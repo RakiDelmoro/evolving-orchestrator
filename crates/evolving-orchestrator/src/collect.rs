@@ -42,6 +42,27 @@ pub fn collect(
     run_dir: &Path,
     runner: &dyn EpisodeRunner,
 ) -> Result<CollectionOutcome> {
+    collect_with_base(
+        config,
+        task,
+        retained_design,
+        teacher_directive,
+        run_dir,
+        runner,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn collect_with_base(
+    config: &CycleConfig,
+    task: &Task,
+    retained_design: &str,
+    teacher_directive: &str,
+    run_dir: &Path,
+    runner: &dyn EpisodeRunner,
+    base_workspace: Option<&Path>,
+) -> Result<CollectionOutcome> {
     let teacher_dir = run_dir.join("teacher_prompts");
     fs::create_dir_all(&teacher_dir)?;
     let teacher_prompt = teacher_dir.join(format!("query{}.txt", task.id));
@@ -87,6 +108,7 @@ pub fn collect(
             seed,
             model_id: &config.model_id,
             endpoint: &config.endpoint,
+            base_workspace,
         });
         match outcome {
             Ok(result) if result.is_success() => {

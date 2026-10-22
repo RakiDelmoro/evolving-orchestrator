@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{EvolveError, Result};
+use crate::quality::QualityPolicy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -276,6 +277,8 @@ pub struct CycleConfig {
     pub executor: ExecutorConfig,
     #[serde(default)]
     pub judge: JudgeConfig,
+    #[serde(default)]
+    pub quality: QualityPolicy,
 }
 
 impl CycleConfig {
@@ -335,6 +338,7 @@ impl CycleConfig {
             ));
         }
         self.training.validate()?;
+        self.quality.validate()?;
         Ok(())
     }
 

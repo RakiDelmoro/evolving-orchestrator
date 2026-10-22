@@ -133,6 +133,13 @@ impl Proposer for ModelProposer<'_> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[derive(Debug, Clone, Default)]
+pub struct SearchSeed<'a> {
+    pub initial_design: Option<&'a str>,
+    pub base_workspace: Option<&'a Path>,
+    pub gate_feedback: Option<&'a str>,
+}
+
 pub fn run_search(
     config: &CycleConfig,
     task: &Task,
@@ -141,6 +148,29 @@ pub fn run_search(
     runner: &dyn EpisodeRunner,
     judge: &dyn PairwiseJudge,
     proposer: &dyn Proposer,
+) -> Result<SearchOutcome> {
+    run_search_seeded(
+        config,
+        task,
+        parsed,
+        paths,
+        runner,
+        judge,
+        proposer,
+        &SearchSeed::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_search_seeded(
+    config: &CycleConfig,
+    task: &Task,
+    parsed: &ParsedQuery,
+    paths: &SearchPaths,
+    runner: &dyn EpisodeRunner,
+    judge: &dyn PairwiseJudge,
+    proposer: &dyn Proposer,
+    seed: &SearchSeed<'_>,
 ) -> Result<SearchOutcome> {
     fs::create_dir_all(paths.versions_dir())?;
     fs::create_dir_all(paths.updated_dir())?;
@@ -165,6 +195,7 @@ pub fn run_search(
         seed: config.search.seed_base + u64::from(task.id),
         model_id: &config.model_id,
         endpoint: &config.endpoint,
+        base_workspace: seed.base_workspace,
     })?;
     if !reference.is_success() {
         return Err(EvolveError::Episode(format!(
@@ -181,7 +212,10 @@ pub fn run_search(
 
     for k in 0..=config.search.iterations {
         let design = if k == 0 {
-            parsed.design.trim().to_string()
+            seed.initial_design
+                .unwrap_or(&parsed.design)
+                .trim()
+                .to_string()
         } else {
             fs::read_to_string(paths.version_path(k)).map_err(|error| {
                 EvolveError::Design(format!("missing design v{k} for task {}: {error}", task.id))
@@ -208,6 +242,7 @@ pub fn run_search(
             seed: config.search.seed_base + u64::from(task.id) + u64::from(k) * 1000,
             model_id: &config.model_id,
             endpoint: &config.endpoint,
+            base_workspace: seed.base_workspace,
         })?;
         if !outcome.is_success() {
             return Err(EvolveError::Episode(format!(
@@ -330,7 +365,13 @@ pub fn run_search(
 
         if k < config.search.iterations {
             let bundle = build_bundle(&paths.workspace(k), &task.task_text, Some(&paths.logs(k)))?;
-            let evidence = bundle.render("candidate");
+            let mut evidence = bundle.render("candidate");
+            if let Some(feedback) = seed.gate_feedback {
+                if !feedback.trim().is_empty() {
+                    evidence.push_str("\n\n# Previous quality failures\n\n");
+                    evidence.push_str(feedback.trim());
+                }
+            }
             let best_rationale = history
                 .iter()
                 .rev()
@@ -547,6 +588,7 @@ mod tests {
             },
             executor: ExecutorConfig::default(),
             judge: JudgeConfig::default(),
+            quality: Default::default(),
         }
     }
 
