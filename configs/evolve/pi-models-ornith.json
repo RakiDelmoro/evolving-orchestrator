@@ -1,0 +1,22 @@
+{
+  "providers": {
+    "local": {
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "local",
+      "models": [
+        {
+          "id": "Ornith-1.5-35B-A3B",
+          "contextWindow": 65536,
+          "maxTokens": 16384,
+          "input": ["text"],
+          "samplingParams": {
+            "temperature": 0.6,
+            "top_p": 0.95,
+            "top_k": 20
+          }
+        }
+      ]
+    }
+  }
+}
